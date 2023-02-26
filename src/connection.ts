@@ -19,6 +19,8 @@ import {
 import { FieldInfo, parseField, parseRow } from "./packets/parsers/result.ts";
 import { PacketType } from "./constant/packet.ts";
 import authPlugin from "./auth_plugin/index.ts";
+import { parseAuthSwitch } from "./packets/parsers/authswitch.ts";
+import auth from "./auth.ts";
 import ServerCapabilities from "./constant/capabilities.ts";
 
 /**
@@ -117,13 +119,41 @@ export class Connection {
           handler = adaptedPlugin;
           break;
         case AuthResult.MethodMismatch:
-          // TODO: Negotiate
-          throw new Error("Currently cannot support auth method mismatch!");
+          const authSwitch = parseAuthSwitch(receive.body);
+          // If CLIENT_PLUGIN_AUTH capability is not supported, no new cipher is
+          // sent and we have to keep using the cipher sent in the init packet.
+          if (
+            authSwitch.authPluginData === undefined ||
+            authSwitch.authPluginData.length === 0
+          ) {
+            authSwitch.authPluginData = handshakePacket.seed;
+          }
+
+          let authData;
+          if (password) {
+            authData = auth(
+              authSwitch.authPluginName,
+              password,
+              authSwitch.authPluginData,
+            );
+          } else {
+            authData = Uint8Array.from([]);
+          }
+
+          await new SendPacket(authData, receive.header.no + 1).send(this.conn);
+
+          receive = await this.nextPacket();
+          const authSwitch2 = parseAuthSwitch(receive.body);
+          if (authSwitch2.authPluginName !== "") {
+            throw new Error(
+              "Do not allow to change the auth plugin more than once!",
+            );
+          }
       }
 
       let result;
       if (handler) {
-        result = handler.start(handshakePacket.seed, password!);
+        result = await handler.start(handshakePacket.seed, password!);
         while (!result.done) {
           if (result.data) {
             const sequenceNumber = receive.header.no + 1;
@@ -134,7 +164,7 @@ export class Connection {
             await this.nextPacket();
           }
           if (result.next) {
-            result = result.next(receive);
+            result = await result.next(receive);
           }
         }
       }
@@ -210,34 +240,6 @@ export class Connection {
     this.close();
   };
 
-  /**
-   * Check if database server version is less than 5.7.0
-   *
-   * MySQL version is "x.y.z"
-   *   eg "5.5.62"
-   *
-   * MariaDB version is "5.5.5-x.y.z-MariaDB[-build-infos]" for versions after 5 (10.0 etc)
-   *   eg "5.5.5-10.4.10-MariaDB-1:10.4.10+maria~bionic"
-   * and "x.y.z-MariaDB-[build-infos]" for 5.x versions
-   *   eg "5.5.64-MariaDB-1~trusty"
-   */
-  private lessThan5_7(): Boolean {
-    const version = this.serverVersion;
-    if (!version.includes("MariaDB")) return version < "5.7.0";
-    const segments = version.split("-");
-    // MariaDB v5.x
-    if (segments[1] === "MariaDB") return segments[0] < "5.7.0";
-    // MariaDB v10+
-    return false;
-  }
-
-  /** Check if the MariaDB version is 10.0 or 10.1 */
-  private isMariaDBAndVersion10_0Or10_1(): Boolean {
-    const version = this.serverVersion;
-    if (!version.includes("MariaDB")) return false;
-    return version.includes("5.5.5-10.1") || version.includes("5.5.5-10.0");
-  }
-
   /** Close database connection */
   close(): void {
     if (this.state != ConnectionState.CLOSED) {
@@ -303,8 +305,8 @@ export class Connection {
       }
 
       const rows = [];
-      if (this.lessThan5_7() || this.isMariaDBAndVersion10_0Or10_1()) {
-        // EOF(less than 5.7 or mariadb version is 10.0 or 10.1)
+      if (!(this.capabilities & ServerCapabilities.CLIENT_DEPRECATE_EOF)) {
+        // EOF(mysql < 5.7 or mariadb < 10.2)
         receive = await this.nextPacket();
         if (receive.type !== PacketType.EOF_Packet) {
           throw new ProtocolError();
@@ -314,7 +316,11 @@ export class Connection {
       if (!iterator) {
         while (true) {
           receive = await this.nextPacket();
-          if (receive.type === PacketType.EOF_Packet) {
+          // OK_Packet when CLIENT_DEPRECATE_EOF is set. OK_Packet can be 0xfe or 0x00
+          if (
+            receive.type === PacketType.EOF_Packet ||
+            receive.type === PacketType.OK_Packet
+          ) {
             break;
           } else {
             const row = parseRow(receive.body, fields);
